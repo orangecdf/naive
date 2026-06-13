@@ -1,7 +1,17 @@
 #!/usr/bin/env bash
 export PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin:~/bin
 
-naive_systemd_version="${1:-latest}"
+# -u / --uninstall: 直接卸载，跳过菜单
+naive_action=""
+naive_systemd_version="latest"
+for arg in "$@"; do
+  case "$arg" in
+  -u|--uninstall) naive_action="uninstall" ;;
+  *) naive_systemd_version="$arg" ;;
+  esac
+done
+
+CRON_TAG="# naive-auto-restart"
 
 init_var() {
   ECHO_TYPE="echo -e"
@@ -165,8 +175,11 @@ check_sys() {
 install_depend() {
   if [[ "${package_manager}" == 'apt-get' || "${package_manager}" == 'apt' ]]; then
     ${package_manager} update -y
+    ${package_manager} install -y curl systemd nftables cron
+  else
+    ${package_manager} install -y curl systemd nftables cronie
+    systemctl enable --now crond 2>/dev/null
   fi
-  ${package_manager} install -y curl systemd nftables
 }
 
 install_binary() {
@@ -518,8 +531,10 @@ upgrade_naive() {
 }
 
 uninstall_all() {
-  read -r -p "确认卸载所有节点？(y/N): " confirm
-  [[ "${confirm}" != "y" && "${confirm}" != "Y" ]] && return
+  if [[ "${naive_action}" != "uninstall" ]]; then
+    read -r -p "确认卸载所有节点及依赖？(y/N): " confirm
+    [[ "${confirm}" != "y" && "${confirm}" != "Y" ]] && return
+  fi
 
   for config in "${NAIVE_CONFIGS}"naive-*.json; do
     [[ -f "$config" ]] || continue
@@ -531,12 +546,40 @@ uninstall_all() {
 
   rm -f /etc/systemd/system/naive@.service
   rm -f /usr/local/bin/na
+  (crontab -l 2>/dev/null | grep -vF "${CRON_TAG}") | crontab - 2>/dev/null
   systemctl daemon-reload
   systemctl reset-failed
   rm -rf "${NAIVE_DATA}"
-  echo_content skyBlue "---> 已卸载全部 naive 及快捷命令 na"
+
+  # 卸载安装时引入的依赖
+  if [[ "${package_manager}" == 'apt-get' || "${package_manager}" == 'apt' ]]; then
+    ${package_manager} purge -y nftables
+  else
+    ${package_manager} remove -y nftables
+  fi
+
+  echo_content skyBlue "---> 已卸载全部 naive 节点、依赖及快捷命令 na"
 }
 
+
+setup_auto_restart() {
+  local existing
+  existing=$(crontab -l 2>/dev/null | grep -F "${CRON_TAG}")
+
+  if [[ -n "${existing}" ]]; then
+    echo_content yellow "当前已开启每日 4 点自动重启"
+    read -r -p "是否取消该计划任务？(y/N): " confirm
+    if [[ "${confirm}" == "y" || "${confirm}" == "Y" ]]; then
+      (crontab -l 2>/dev/null | grep -vF "${CRON_TAG}") | crontab -
+      echo_content skyBlue "---> 已取消每日自动重启"
+    fi
+    return
+  fi
+
+  local cron_line="0 4 * * * for s in \$(systemctl list-units --type=service --all --no-legend 'naive@*' | awk '{print \$1}'); do systemctl restart \"\$s\"; done ${CRON_TAG}"
+  (crontab -l 2>/dev/null; echo "${cron_line}") | crontab -
+  echo_content skyBlue "---> 已设置每天凌晨 4 点自动重启所有节点"
+}
 show_menu() {
   clear
   echo_content red    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -551,6 +594,7 @@ show_menu() {
   echo_content yellow " 3. 查看节点日志"
   echo_content yellow " 4. 升级 naive 二进制"
   echo_content yellow " 5. 卸载全部"
+  echo_content yellow " 6. 每日 4 点自动重启 开/关"
   echo_content yellow " 0. 退出"
   echo_content red    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 }
@@ -559,6 +603,13 @@ main() {
   cd "$HOME" || exit 0
   init_var
   check_sys
+
+  if [[ "${naive_action}" == "uninstall" ]]; then
+    echo_content green "---> 执行 na -u，开始卸载 naive 及依赖"
+    uninstall_all
+    exit 0
+  fi
+
   install_depend
   install_shortcut
 
@@ -581,6 +632,7 @@ main() {
       ;;
     4) upgrade_naive ;;
     5) uninstall_all ;;
+    6) setup_auto_restart ;;
     0) exit 0 ;;
     *) echo_content red " 无效选项" ;;
     esac
